@@ -207,7 +207,11 @@ jobs:
         run: |
           set -euo pipefail
           ls -la release
-          app="$(find release -maxdepth 2 -name '*.app' -type d | head -n 1)"
+          # Verify the zip Squirrel.Mac installs, not the staging copy.
+          unpacked="$RUNNER_TEMP/verify-app"
+          rm -rf "$unpacked"
+          ditto -x -k release/*-arm64.zip "$unpacked"
+          app="$(find "$unpacked" -maxdepth 1 -name '*.app' -type d | head -n 1)"
           codesign --verify --deep --strict --verbose=2 "$app"
           codesign -d -r- "$app"
           test -f release/nightly-mac.yml
