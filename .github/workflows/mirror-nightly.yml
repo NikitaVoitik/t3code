@@ -1,0 +1,242 @@
+name: Mirror upstream nightly
+
+# Rebuilds each upstream T3 Code nightly with this fork's `custom` commits on
+# top and publishes it here under the same tag and version. The desktop app
+# updates from this repo's releases, and servers update from npm to the same
+# version, so the update button keeps desktop and servers in step.
+
+on:
+  schedule:
+    # Upstream publishes nightlies a few times a day.
+    - cron: "17 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream nightly tag to build (default latest)
+        required: false
+        type: string
+      rebuild:
+        description: Replace this fork's release if the tag is already mirrored
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: mirror-nightly
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: pingdotgg/t3code
+  CUSTOM_BRANCH: custom
+  SELF_SIGN_IDENTITY: T3 Code Fork Signing
+  CONFLICT_ISSUE_TITLE: "Mirror: custom commits no longer apply on upstream nightly"
+
+jobs:
+  check:
+    name: Find new upstream nightly
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - name: Resolve tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REBUILD: ${{ inputs.rebuild }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-}"
+          if [[ -z "$tag" ]]; then
+            tag="$(gh release list -R "$UPSTREAM" --limit 40 --exclude-drafts \
+              --json tagName,publishedAt \
+              -q '[.[] | select(.tagName | test("-nightly\\."))] | sort_by(.publishedAt) | last | .tagName // ""')"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]{8}\.[0-9]+$ ]]; then
+            echo "::error::'$tag' is not an upstream nightly tag."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [[ "$REBUILD" != "true" ]]; then
+            echo "$tag is already mirrored."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Mirroring $tag."
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build macOS arm64 ${{ needs.check.outputs.tag }}
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 75
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - name: Check out upstream tag with custom commits
+        id: source
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git remote add fork "https://github.com/$GITHUB_REPOSITORY.git"
+          git fetch -q --filter=blob:none --no-tags upstream \
+            "+refs/heads/main:refs/remotes/upstream/main" "+refs/tags/$TAG:refs/tags/$TAG"
+          git fetch -q --filter=blob:none --no-tags fork \
+            "+refs/heads/$CUSTOM_BRANCH:refs/remotes/fork/$CUSTOM_BRANCH"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout -q --detach "$TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          commits="$(git rev-list --reverse --no-merges "upstream/main..fork/$CUSTOM_BRANCH")"
+          {
+            echo "commits<<EOF"
+            if [[ -n "$commits" ]]; then
+              git log --no-walk=unsorted --format='- %s (%h)' $commits
+            else
+              echo "- (no custom commits)"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          for commit in $commits; do
+            if ! git cherry-pick "$commit"; then
+              git cherry-pick --abort || true
+              echo "conflict=$commit" >> "$GITHUB_OUTPUT"
+              echo "::error::$(git log -1 --format='%h %s' "$commit") does not apply on $TAG."
+              exit 1
+            fi
+          done
+          git log --oneline -n "$(( $(wc -w <<<"$commits") + 1 ))"
+
+      - name: Report conflict
+        if: failure() && steps.source.outputs.conflict != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONFLICT: ${{ steps.source.outputs.conflict }}
+        run: |
+          set -euo pipefail
+          existing="$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$CONFLICT_ISSUE_TITLE\"" --json number -q '.[0].number // ""')"
+          if [[ -n "$existing" ]]; then
+            echo "Issue #$existing is already open."
+            exit 0
+          fi
+          gh issue create -R "$GITHUB_REPOSITORY" --title "$CONFLICT_ISSUE_TITLE" --body "$(cat <<EOF
+          Commit \`$CONFLICT\` on \`$CUSTOM_BRANCH\` conflicts with upstream \`$TAG\`, so nightlies stopped mirroring.
+
+          Rebase \`$CUSTOM_BRANCH\` onto \`upstream/main\`, resolve the conflict, and push. The next scheduled run picks it up.
+
+          Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          EOF
+          )"
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install dependencies
+        run: vp install --filter=t3... --filter=@t3tools/web... --filter=@t3tools/desktop... --filter=@t3tools/scripts...
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      # The same public T3 Connect identifiers official builds carry.
+      - name: Enable T3 Connect
+        run: cp .env.example .env
+
+      - name: Align package versions to release version
+        run: node scripts/update-release-package-versions.ts "$VERSION"
+
+      - name: Build JS bundle
+        run: vp run build:desktop
+
+      - name: Import self-signed certificate
+        env:
+          MACOS_SELF_SIGN_P12: ${{ secrets.MACOS_SELF_SIGN_P12 }}
+          MACOS_SELF_SIGN_PASSWORD: ${{ secrets.MACOS_SELF_SIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$MACOS_SELF_SIGN_P12" || -z "$MACOS_SELF_SIGN_PASSWORD" ]]; then
+            echo "::error::MACOS_SELF_SIGN_P12 and MACOS_SELF_SIGN_PASSWORD secrets are required."
+            exit 1
+          fi
+          p12="$RUNNER_TEMP/self-sign.p12"
+          keychain="$RUNNER_TEMP/fork-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 16)"
+          printf '%s' "$MACOS_SELF_SIGN_P12" | base64 -D > "$p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$p12" -k "$keychain" -P "$MACOS_SELF_SIGN_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm -f "$p12"
+
+          # electron-builder only signs with identities codesign reports as
+          # valid, so trust the self-signed certificate on this runner.
+          security find-certificate -c "$SELF_SIGN_IDENTITY" -p "$keychain" > "$RUNNER_TEMP/self-sign.pem"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/self-sign.pem"
+          security find-identity -v -p codesigning "$keychain"
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      - name: Build desktop artifact
+        env:
+          T3CODE_MACOS_SELF_SIGN_IDENTITY: ${{ env.SELF_SIGN_IDENTITY }}
+          T3CODE_DESKTOP_UPDATE_REPOSITORY: ${{ github.repository }}
+        run: |
+          node scripts/build-desktop-artifact.ts \
+            --platform mac --target dmg --arch arm64 \
+            --build-version "$VERSION" --skip-build --verbose
+
+      - name: Verify signature and update feed
+        run: |
+          set -euo pipefail
+          ls -la release
+          app="$(find release -maxdepth 2 -name '*.app' -type d | head -n 1)"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -d -r- "$app"
+          test -f release/nightly-mac.yml
+          cat release/nightly-mac.yml
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REBUILD: ${{ inputs.rebuild }}
+          CUSTOM_COMMITS: ${{ steps.source.outputs.commits }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(release/*.dmg release/*.zip release/*.blockmap release/nightly*.yml)
+          upstream_notes="$(gh release view "$TAG" -R "$UPSTREAM" --json body -q .body)"
+          {
+            printf '%s\n\n' "$upstream_notes"
+            printf -- '---\n\nFork build of [%s](%s/%s/releases/tag/%s) with `%s`:\n\n%s\n' \
+              "$TAG" "$GITHUB_SERVER_URL" "$UPSTREAM" "$TAG" "$CUSTOM_BRANCH" "$CUSTOM_COMMITS"
+          } > "$RUNNER_TEMP/notes.md"
+          if [[ "$REBUILD" == "true" ]]; then
+            gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          fi
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --prerelease \
+            --title "T3 Code Nightly $VERSION (fork)" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "${files[@]}"
+
+      - name: Remove signing keychain
+        if: always() && env.SIGNING_KEYCHAIN != ''
+        run: security delete-keychain "$SIGNING_KEYCHAIN" || true
