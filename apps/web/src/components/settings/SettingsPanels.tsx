@@ -274,6 +274,7 @@ function AboutVersionTitle() {
     <span className="inline-flex items-baseline gap-2">
       <span>Version</span>
       <code className="text-2xs font-medium text-muted-foreground">{APP_VERSION}</code>
+      <span className="text-2xs text-muted-foreground">fork build</span>
     </span>
   );
 }
